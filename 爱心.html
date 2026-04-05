@@ -258,11 +258,14 @@
             pinchReleaseCountdown: 0,
             modeSwitchCooldown: 0,
             resetGestureCooldown: 0,
+            scatterReadiness: 0,
             lastGrabbedPhotoId: null,
             grabRoundRemainingIds: [],
             photos: [], // Array of objects {id, mesh, dataUrl}
             uiVisible: true,
-            isPinching: false
+            isPinching: false,
+            pinchReady: true,
+            pinchReleaseFrames: 0
         };
 
         const CONFIG = {
@@ -294,7 +297,10 @@
             focusMinDistance: 12.5,
             focusMaxDistance: 18.5,
             focusSafeMargin: 0.14,
-            pinchReleaseGraceFrames: 8
+            pinchReleaseGraceFrames: 16,
+            pinchHoldStrengthMin: 0.05,
+            pinchRearmReleaseFrames: 5,
+            pinchEnableScatterThreshold: 0.62
         };
 
         const STANDARD_HEART = {
@@ -338,16 +344,42 @@
             });
         };
 
-        document.getElementById('btn-toggle-ui').addEventListener('click', () => {
-            state.uiVisible = !state.uiVisible;
+        const setUiVisible = (visible) => {
+            state.uiVisible = visible;
             const els = document.querySelectorAll('.glass-panel, #cam-preview-container');
             els.forEach(el => el.style.opacity = state.uiVisible ? '1' : '0');
             ensureTitlesVisible();
+        };
+
+        const isFullscreenActive = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+
+        const requestAppFullscreen = () => {
+            const el = document.documentElement;
+            if (el.requestFullscreen) return el.requestFullscreen();
+            if (el.webkitRequestFullscreen) return el.webkitRequestFullscreen();
+            return Promise.resolve();
+        };
+
+        const exitAppFullscreen = () => {
+            if (document.exitFullscreen) return document.exitFullscreen();
+            if (document.webkitExitFullscreen) return document.webkitExitFullscreen();
+            return Promise.resolve();
+        };
+
+        const enterFullscreenAndHideUi = () => {
+            setUiVisible(false);
+            if (!isFullscreenActive()) {
+                requestAppFullscreen().catch(() => {});
+            }
+        };
+
+        document.getElementById('btn-toggle-ui').addEventListener('click', () => {
+            setUiVisible(!state.uiVisible);
         });
 
         document.getElementById('btn-fullscreen').addEventListener('click', () => {
-            if (!document.fullscreenElement) document.documentElement.requestFullscreen();
-            else if (document.exitFullscreen) document.exitFullscreen();
+            if (!isFullscreenActive()) requestAppFullscreen().catch(() => {});
+            else exitAppFullscreen().catch(() => {});
         });
 
         document.addEventListener('fullscreenchange', () => {
@@ -1070,7 +1102,12 @@
                 }
             }
 
-            if (!picked) picked = pool[0];
+            if (!picked) picked = pool.find(c => c.id !== state.lastGrabbedPhotoId) || pool[0];
+
+            if (picked && picked.id === state.lastGrabbedPhotoId) {
+                const alt = candidates.find(c => c.id !== state.lastGrabbedPhotoId);
+                if (alt) picked = alt;
+            }
 
             if (consume && picked) {
                 state.grabRoundRemainingIds = state.grabRoundRemainingIds.filter(id => id !== picked.id);
@@ -1080,7 +1117,10 @@
             return picked ? picked.mesh : null;
         };
 
-        const canGrabPhotoNow = () => state.targetMode === 'SCATTER';
+        const canGrabPhotoNow = () => (
+            state.targetMode === 'SCATTER'
+            && state.scatterReadiness >= INTERACTION_CONFIG.pinchEnableScatterThreshold
+        );
         
         const grabPhoto = () => {
             if (!canGrabPhotoNow()) return;
@@ -1133,6 +1173,11 @@
 
         // Keyboard Fallbacks
         window.addEventListener('keydown', (e) => {
+            if (e.shiftKey && e.code === 'KeyF') {
+                e.preventDefault();
+                enterFullscreenAndHideUi();
+                return;
+            }
             if (e.code === 'Space') state.targetMode = 'TREE';
             if (e.code === 'KeyZ') state.targetMode = 'SCATTER';
             if (e.code === 'KeyR') performResetGesture();
@@ -1163,6 +1208,9 @@
         const animate = () => {
             requestAnimationFrame(animate);
             const delta = clock.getDelta();
+            const scatterTarget = state.targetMode === 'SCATTER' ? 1 : 0;
+            const scatterLerp = THREE.MathUtils.clamp(delta * 2.0, 0, 1);
+            state.scatterReadiness = THREE.MathUtils.lerp(state.scatterReadiness, scatterTarget, scatterLerp);
 
             // MediaPipe Logic
             if (handLandmarker && video.readyState >= 2) {
@@ -1182,8 +1230,21 @@
                         const landmarks = results.landmarks[0];
                         const rawGesture = detectGesture(landmarks);
                         const gesture = getStableGesture(rawGesture);
-                        const pinchSignal = (rawGesture === 'PINCH' || gesture === 'PINCH');
+                        const pinchStartSignal = (rawGesture === 'PINCH' || gesture === 'PINCH');
+                        const pinchHoldSignal = getPinchStrength(landmarks) > INTERACTION_CONFIG.pinchHoldStrengthMin;
+                        const pinchSignal = state.isPinching ? (pinchStartSignal || pinchHoldSignal) : pinchStartSignal;
+                        const fistReleaseSignal = state.isPinching && gesture === 'FIST' && !pinchStartSignal && !pinchHoldSignal;
                         const resetSignal = (gesture === 'RESET');
+
+                        // Require several released frames before allowing another grab.
+                        if (!pinchSignal) {
+                            state.pinchReleaseFrames += 1;
+                            if (state.pinchReleaseFrames >= INTERACTION_CONFIG.pinchRearmReleaseFrames) {
+                                state.pinchReady = true;
+                            }
+                        } else {
+                            state.pinchReleaseFrames = 0;
+                        }
 
                         if (state.resetGestureCooldown > 0) state.resetGestureCooldown -= 1;
                         if (resetSignal && state.resetGestureCooldown === 0) {
@@ -1193,10 +1254,17 @@
 
                         // Robust mode switching: accept either raw or stable OPEN/FIST, with a short cooldown.
                         if (state.modeSwitchCooldown > 0) state.modeSwitchCooldown -= 1;
+                        if (state.isPinching && fistReleaseSignal) {
+                            state.isPinching = false;
+                            state.pinchReleaseCountdown = 0;
+                            releasePhoto();
+                            state.targetMode = 'TREE';
+                            state.modeSwitchCooldown = 6;
+                        }
                         let nextMode = null;
                         if (rawGesture === 'OPEN' || gesture === 'OPEN') nextMode = 'SCATTER';
                         if (rawGesture === 'FIST' || gesture === 'FIST') nextMode = 'TREE';
-                        if (!resetSignal && nextMode && nextMode !== state.targetMode && state.modeSwitchCooldown === 0) {
+                        if (!resetSignal && nextMode && nextMode !== state.targetMode && state.modeSwitchCooldown === 0 && !state.isPinching && !state.focusMesh) {
                             state.targetMode = nextMode;
                             state.modeSwitchCooldown = 6;
                             if (nextMode === 'TREE' && state.isPinching) {
@@ -1207,9 +1275,13 @@
                         }
 
                         const modeText = state.targetMode === 'SCATTER' ? '散开' : '聚合';
+                        const scatterReady = state.scatterReadiness >= INTERACTION_CONFIG.pinchEnableScatterThreshold;
+                        const spreadText = `发散${Math.round(state.scatterReadiness * 100)}%`;
                         const canGrab = canGrabPhotoNow() || state.isPinching;
                         const hasCenterPhoto = canGrab && !!selectGrabCandidate(false);
-                        const centerText = !canGrab ? '聚合时不显示照片' : (hasCenterPhoto ? '中心可抓取' : '等待照片到中心');
+                        const centerText = !canGrab
+                            ? (state.targetMode === 'SCATTER' && !scatterReady ? `${spreadText}，等待可捏合` : '聚合时不显示照片')
+                            : (hasCenterPhoto ? '中心可抓取' : '等待照片到中心');
                         if (resetSignal) setCamStatus(`AI: RESET | 模式:${modeText} | 已恢复`, '#8ed8ff');
                         else if (rawGesture === 'UNKNOWN') setCamStatus(`AI: 检测到手 | 模式:${modeText} | ${centerText}`, '#55ff99');
                         else setCamStatus(`AI: ${rawGesture} | 模式:${modeText} | ${centerText}`, '#55ff99');
@@ -1221,9 +1293,13 @@
                         }
 
                         if (canGrab && pinchSignal) {
-                            if(!state.isPinching) {
+                            if(!state.isPinching && state.pinchReady) {
                                 grabPhoto();
                                 state.isPinching = !!state.focusMesh;
+                                if (state.isPinching) {
+                                    state.pinchReady = false;
+                                    state.pinchReleaseFrames = 0;
+                                }
                             }
                             if (state.isPinching && state.focusMesh) {
                                 state.pinchReleaseCountdown = INTERACTION_CONFIG.pinchReleaseGraceFrames;
@@ -1246,6 +1322,8 @@
                         state.handRotationTarget.x = 0;
                         state.handRotationTarget.y = 0;
                         state.pinchReleaseCountdown = 0;
+                        state.pinchReady = true;
+                        state.pinchReleaseFrames = 0;
                         if (state.isPinching) { state.isPinching = false; releasePhoto(); }
                     }
                 }

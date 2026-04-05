@@ -9,6 +9,11 @@ A static interactive showcase page built with Three.js and MediaPipe hand gestur
 - Built-in gallery photos (no manual upload required)
 - Built-in background music
 - Fullscreen-ready display mode for exhibitions
+- One-key presentation shortcut: Shift+F enters fullscreen and hides UI panels
+
+## Keyboard Shortcuts
+
+- Shift+F: enter fullscreen and hide the UI at the same time
 
 ## Run Locally
 
