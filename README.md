@@ -31,8 +31,7 @@ http://127.0.0.1:5500/index.html
 
 ## Entry Files
 
-- Main source: index.html
-- Legacy entry links heart.html and 爱心.html now redirect to index.html
+- Single entry file: index.html
 
 ## Deploy to GitHub Pages
 
